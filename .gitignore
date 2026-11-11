@@ -1,0 +1,39 @@
+# Python & Virtual Environments
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Environment & Secrets
+.env
+*.local
+*.secret
+*.pem
+*.key
+
+# SQLite Databases & Local Runtime State
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+data/*.sqlite3*
+data/*.db
+data/test_*.json
+data/is_validation_memory.json
+data/non_existent.json
+
+# Temporary & Test Artefacts
+MagicMock/
+scratch/
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
