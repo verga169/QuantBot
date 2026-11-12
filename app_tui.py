@@ -22,7 +22,7 @@ import select
 import termios
 import tty
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -255,6 +255,162 @@ class TradingAppTUI:
                 return {"total": total, "wins": wins, "losses": losses, "wr": wr, "sum_pnl": sum_pnl}
         except Exception:
             return {"total": 0, "wins": 0, "losses": 0, "wr": 0.0, "sum_pnl": 0.0}
+
+    def _get_weekly_trades(self, days: int = 7) -> Dict[str, Any]:
+        """
+        Recupera le operazioni della settimana (ultimi 7 giorni o aperte)
+        con dettagli formattati, durate, PnL e statistiche aggregate.
+        """
+        try:
+            now_utc = datetime.now(timezone.utc)
+            cutoff_utc = now_utc - timedelta(days=days)
+            cutoff_iso = cutoff_utc.isoformat()
+            
+            with self.engine.db_lock:
+                rows = self.engine.db.execute(
+                    """
+                    SELECT * FROM paper_orders
+                    WHERE entry_time_utc >= ? OR status = 'OPEN'
+                    ORDER BY id DESC
+                    """,
+                    (cutoff_iso,)
+                ).fetchall()
+            
+            with self.lock:
+                ticker_bid = float(self.last_ticker.get("bid", 0.0))
+            
+            trades = []
+            closed_count = 0
+            open_count = 0
+            wins = 0
+            losses = 0
+            realized_pnl = 0.0
+            unrealized_pnl = 0.0
+            
+            for r in rows:
+                status = str(r["status"] or "CLOSED").upper()
+                trade_id = int(r["id"])
+                setup = str(r["signal_setup"] or "SETUP")
+                side = str(r["side"] or "LONG").upper()
+                qty = float(r["qty"] or 0.0)
+                entry_fill = float(r["entry_fill"] or 0.0)
+                notional = float(r["notional_quote"] or (qty * entry_fill))
+                stop_price = float(r["stop_price"] or 0.0)
+                target_price = float(r["target_price"] or 0.0)
+                entry_time_str = str(r["entry_time_utc"] or "")
+                
+                # Conversione data/ora in locale
+                entry_dt_local = None
+                entry_dt_utc = None
+                try:
+                    entry_dt_utc = datetime.fromisoformat(entry_time_str)
+                    entry_dt_local = entry_dt_utc.astimezone(ZoneInfo(Config.LOCAL_TIMEZONE))
+                    entry_display = entry_dt_local.strftime("%d/%m %H:%M")
+                except Exception:
+                    entry_display = entry_time_str[:16] if entry_time_str else "--"
+                
+                if status == "OPEN":
+                    open_count += 1
+                    current_price = ticker_bid or entry_fill
+                    exit_display = f"${current_price:,.2f}"
+                    pnl = (current_price - entry_fill) * qty - float(r["entry_fee_quote"] or 0.0)
+                    pnl_pct = ((current_price - entry_fill) / entry_fill * 100.0) if entry_fill > 0 else 0.0
+                    unrealized_pnl += pnl
+                    exit_reason = "IN_CORSO"
+                    exit_reason_label = "[bold green]⚡ APERTA (In Corso)[/bold green]"
+                    
+                    if entry_dt_utc:
+                        dur_sec = max(0, int((now_utc - entry_dt_utc.astimezone(timezone.utc)).total_seconds()))
+                        dur_h = dur_sec // 3600
+                        dur_m = (dur_sec % 3600) // 60
+                        duration_display = f"{dur_h}h {dur_m:02d}m"
+                    else:
+                        duration_display = "--"
+                else:
+                    closed_count += 1
+                    exit_fill = float(r["exit_fill"] or 0.0)
+                    exit_display = f"${exit_fill:,.2f}" if exit_fill > 0 else "--"
+                    pnl = float(r["pnl_quote"] or 0.0)
+                    pnl_pct = (pnl / notional * 100.0) if notional > 0 else 0.0
+                    realized_pnl += pnl
+                    if pnl > 0:
+                        wins += 1
+                    else:
+                        losses += 1
+                    
+                    exit_reason = str(r["exit_reason"] or "CLOSED")
+                    reason_map = {
+                        "TAKE_PROFIT": "[bold green]🎯 TAKE PROFIT[/bold green]",
+                        "STOP_LOSS": "[bold red]🛑 STOP LOSS[/bold red]",
+                        "TRAIL_TIER1": "[bold cyan]🛡️ TRAIL TIER 1[/bold cyan]",
+                        "TRAIL_TIER2": "[bold cyan]🛡️ TRAIL TIER 2[/bold cyan]",
+                        "TRAILING_STOP": "[bold cyan]🛡️ TRAIL STOP[/bold cyan]",
+                        "TIME_EXIT": "[bold yellow]⏱️ TIME EXIT[/bold yellow]",
+                        "DAILY_LOSS_LIMIT": "[bold red]⛔ MAX LOSS[/bold red]",
+                        "CRITICAL_NEWS_DEFENSE_EXIT": "[bold magenta]🚨 NEWS EXIT[/bold magenta]",
+                    }
+                    exit_reason_label = reason_map.get(exit_reason, f"[white]{exit_reason}[/white]")
+                    
+                    exit_time_str = str(r["exit_time_utc"] or "")
+                    if entry_dt_utc and exit_time_str:
+                        try:
+                            exit_dt_utc = datetime.fromisoformat(exit_time_str)
+                            dur_sec = max(0, int((exit_dt_utc - entry_dt_utc).total_seconds()))
+                            dur_h = dur_sec // 3600
+                            dur_m = (dur_sec % 3600) // 60
+                            duration_display = f"{dur_h}h {dur_m:02d}m"
+                        except Exception:
+                            duration_display = "--"
+                    else:
+                        duration_display = "--"
+                
+                trades.append({
+                    "id": trade_id,
+                    "signal_time": r["signal_time_utc"],
+                    "setup": setup,
+                    "side": side,
+                    "status": status,
+                    "qty": qty,
+                    "notional": notional,
+                    "entry_fill": entry_fill,
+                    "entry_display": entry_display,
+                    "exit_display": exit_display,
+                    "stop_price": stop_price,
+                    "target_price": target_price,
+                    "duration_display": duration_display,
+                    "exit_reason": exit_reason,
+                    "exit_reason_label": exit_reason_label,
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
+                })
+            
+            wr = (wins / closed_count * 100.0) if closed_count > 0 else 0.0
+            
+            return {
+                "trades": trades,
+                "total": len(trades),
+                "closed_count": closed_count,
+                "open_count": open_count,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": wr,
+                "realized_pnl": realized_pnl,
+                "unrealized_pnl": unrealized_pnl,
+                "net_pnl": realized_pnl + unrealized_pnl,
+            }
+        except Exception:
+            return {
+                "trades": [],
+                "total": 0,
+                "closed_count": 0,
+                "open_count": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "net_pnl": 0.0,
+            }
 
     @staticmethod
     def _make_mini_gauge(val: float, max_val: float, width: int = 8, fill_char: str = "█", empty_char: str = "░") -> str:
@@ -805,6 +961,103 @@ class TradingAppTUI:
         
         return Panel(t, title="📈 [bold green]Operazione Aperta (LONG ATTIVA)[/bold green]", border_style="green")
 
+    def make_weekly_trades_panel(self) -> Panel:
+        """Pannello riassuntivo delle ultime operazioni effettuate nella settimana (ultimi 7 giorni)."""
+        data = self._get_weekly_trades(days=7)
+        trades = data["trades"]
+        tot = data["total"]
+        closed = data["closed_count"]
+        wins = data["wins"]
+        losses = data["losses"]
+        wr = data["win_rate"]
+        realized_pnl = data["realized_pnl"]
+        open_count = data["open_count"]
+        unrealized_pnl = data["unrealized_pnl"]
+        
+        # Stili PnL
+        pnl_style = "green" if realized_pnl >= 0 else "red"
+        pnl_sign = "+" if realized_pnl >= 0 else ""
+        wr_style = "green" if wr >= 50.0 else ("yellow" if wr > 0 else "dim")
+        
+        title_summary = f"[bold white]{tot}[/bold white] nella settimana [dim]•[/dim] Conclusi: [white]{closed}[/white] ([bold green]{wins}W[/bold green] / [bold red]{losses}L[/bold red] • WR: [bold {wr_style}]{wr:.1f}%[/bold {wr_style}]) [dim]|[/dim] PnL Realizzato: [{pnl_style}]{pnl_sign}{realized_pnl:.2f} USDC[/{pnl_style}]"
+        if open_count > 0:
+            unreal_style = "green" if unrealized_pnl >= 0 else "red"
+            unreal_sign = "+" if unrealized_pnl >= 0 else ""
+            title_summary += f" [dim]|[/dim] Aperte: [bold cyan]{open_count}[/bold cyan] (Non Realizzato: [{unreal_style}]{unreal_sign}{unrealized_pnl:.2f} USDC[/{unreal_style}])"
+
+        if not trades:
+            empty_msg = Text("\n  Nessuna operazione effettuata negli ultimi 7 giorni. Il bot è in monitoraggio attivo dei setup di mercato.", style="dim italic")
+            return Panel(
+                empty_msg,
+                title=f"💼 [bold cyan]Ultime Operazioni Effettuate nella Settimana (BTC/USDC)[/bold cyan]  •  {title_summary}",
+                border_style="cyan",
+                padding=(0, 1),
+            )
+            
+        t = Table(expand=True, box=None, padding=(0, 1), show_header=True, header_style="bold cyan")
+        t.add_column("#", style="dim", width=4, justify="center", no_wrap=True)
+        t.add_column("Data/Ora Ingr.", style="bold white", width=14, justify="center", no_wrap=True)
+        t.add_column("Setup Operativo", width=16, justify="left", no_wrap=True)
+        t.add_column("Side", width=6, justify="center", no_wrap=True)
+        t.add_column("Quantità / Controvalore", width=22, justify="right", no_wrap=True)
+        t.add_column("Prezzo Ingresso", width=16, justify="right", no_wrap=True)
+        t.add_column("Prezzo Uscita / Live", width=20, justify="right", no_wrap=True)
+        t.add_column("Target (SL / TP)", width=24, justify="center", no_wrap=True)
+        t.add_column("Durata", width=10, justify="center", no_wrap=True)
+        t.add_column("Esito / Motivo Uscita", width=22, justify="left", no_wrap=True)
+        t.add_column("PnL Netto (USDC)", width=24, justify="right", no_wrap=True)
+        t.add_column("Stato", width=10, justify="center", no_wrap=True)
+
+        for tr in trades[:6]:
+            tr_id = f"#{tr['id']}"
+            setup_name = tr["setup"].replace("_BOUNCE", "").replace("_REACTIVE", "").replace("_BREAKOUT", "")
+            if "MEAN_REV" in setup_name or "MEAN" in setup_name:
+                setup_label = "[bold magenta]MEAN-REV[/bold magenta]"
+            elif "PULLBACK" in setup_name:
+                setup_label = "[bold cyan]PULLBACK[/bold cyan]"
+            elif "MOMENTUM" in setup_name or "BREAKOUT" in setup_name:
+                setup_label = "[bold yellow]BREAKOUT[/bold yellow]"
+            else:
+                setup_label = f"[bold white]{setup_name}[/bold white]"
+                
+            side_label = f"[bold green]{tr['side']}[/bold green]" if tr["side"] == "LONG" else f"[bold red]{tr['side']}[/bold red]"
+            size_label = f"{tr['qty']:.5f} BTC [dim](${tr['notional']:.1f})[/dim]"
+            entry_p = f"${tr['entry_fill']:,.2f}"
+            exit_p = tr["exit_display"]
+            sl_tp = f"SL: ${tr['stop_price']:,.0f} | TP: ${tr['target_price']:,.0f}"
+            dur = tr["duration_display"]
+            reason = tr["exit_reason_label"]
+            
+            pnl_val = tr["pnl"]
+            pnl_pct_val = tr["pnl_pct"]
+            p_style = "bold green" if pnl_val >= 0 else "bold red"
+            p_sign = "+" if pnl_val >= 0 else ""
+            pnl_str = f"[{p_style}]{p_sign}{pnl_val:.2f} USDC ({p_sign}{pnl_pct_val:.2f}%)[/{p_style}]"
+            
+            status_label = "[bold green]APERTA[/bold green]" if tr["status"] == "OPEN" else "[dim]CHIUSA[/dim]"
+            
+            t.add_row(
+                tr_id,
+                tr["entry_display"],
+                setup_label,
+                side_label,
+                size_label,
+                entry_p,
+                exit_p,
+                sl_tp,
+                dur,
+                reason,
+                pnl_str,
+                status_label,
+            )
+
+        return Panel(
+            t,
+            title=f"💼 [bold cyan]Ultime Operazioni Effettuate nella Settimana (BTC/USDC)[/bold cyan]  •  {title_summary}",
+            border_style="cyan",
+            padding=(0, 0),
+        )
+
     def make_sentiment_panel(self) -> Panel:
         with self.lock:
             with self.engine.db_lock:
@@ -1268,10 +1521,11 @@ class TradingAppTUI:
         t.add_column(justify="center", ratio=1)
         controls = (
             "[bold green][S][/bold green] Avvia/Pausa Trading  |  "
+            "[bold cyan][O][/bold cyan] Dettaglio Operazioni Settimana  |  "
             "[bold yellow][E][/bold yellow] Modifica API Key  |  "
             "[bold cyan][R][/bold cyan] Forza Refresh Totale (Prezzo/News/Indicatori)  |  "
             "[bold red][Q][/bold red] Esci  |  "
-            "🎯 [bold yellow]Radar Condizioni Long: Real-Time[/bold yellow]"
+            "💼 [bold cyan]Ultime Operazioni Settimana: Live[/bold cyan]"
         )
         with self.lock:
             msg = getattr(self, "status_message", "")
@@ -1291,11 +1545,12 @@ class TradingAppTUI:
         )
         
         layout["body"].split_column(
-            Layout(name="chart", ratio=16),
-            Layout(name="top", ratio=11),
-            Layout(name="radar", ratio=14),
-            Layout(name="mid", ratio=11),
-            Layout(name="bottom", ratio=10),
+            Layout(name="chart", ratio=14),
+            Layout(name="top", ratio=10),
+            Layout(name="trades", ratio=9),
+            Layout(name="radar", ratio=12),
+            Layout(name="mid", ratio=9),
+            Layout(name="bottom", ratio=8),
         )
         
         layout["body"]["top"].split_row(
@@ -1318,6 +1573,7 @@ class TradingAppTUI:
         layout["body"]["chart"].update(self.make_chart_panel())
         layout["body"]["top"]["wallet"].update(self.make_wallet_panel())
         layout["body"]["top"]["position"].update(self.make_position_panel())
+        layout["body"]["trades"].update(self.make_weekly_trades_panel())
         layout["body"]["radar"].update(self.make_radar_panel())
         layout["body"]["mid"]["sentiment"].update(self.make_sentiment_panel())
         layout["body"]["mid"]["rl"].update(self.make_rl_panel())
@@ -1517,6 +1773,118 @@ class TradingAppTUI:
             self.console.clear()
             live.start()
 
+    def show_trades_history_dialog(self, live: Live) -> None:
+        """Visualizza a schermo intero lo storico completo delle operazioni con audit approfondito."""
+        live.stop()
+        self.console.clear()
+        
+        data = self._get_weekly_trades(days=7)
+        trades = data["trades"]
+        
+        self.console.print("\n" + "=" * 90, style="bold cyan")
+        self.console.print(" 💼 STORICO OPERAZIONI DELLA SETTIMANA - AUDIT DETTAGLIATO (BTC/USDC)", style="bold white")
+        self.console.print("=" * 90 + "\n", style="bold cyan")
+        
+        tot = data["total"]
+        closed = data["closed_count"]
+        wins = data["wins"]
+        losses = data["losses"]
+        wr = data["win_rate"]
+        realized_pnl = data["realized_pnl"]
+        open_count = data["open_count"]
+        unrealized_pnl = data["unrealized_pnl"]
+        
+        pnl_style = "bold green" if realized_pnl >= 0 else "bold red"
+        pnl_sign = "+" if realized_pnl >= 0 else ""
+        
+        summary_grid = Table.grid(expand=True, padding=(0, 2))
+        summary_grid.add_column(style="dim", justify="left")
+        summary_grid.add_column(style="bold white", justify="left")
+        summary_grid.add_column(style="dim", justify="left")
+        summary_grid.add_column(style="bold white", justify="left")
+        
+        summary_grid.add_row(
+            "Operazioni Totali Settimana:", f"{tot} (Concluse: {closed} • Aperte: {open_count})",
+            "Win Rate Settimanale:", f"{wr:.1f}% ({wins} Vincenti / {losses} Perdenti)"
+        )
+        summary_grid.add_row(
+            "PnL Netto Realizzato:", f"[{pnl_style}]{pnl_sign}{realized_pnl:.2f} USDC[/{pnl_style}]",
+            "PnL Non Realizzato (Posizione):", f"[{pnl_style if unrealized_pnl >= 0 else 'bold red'}]{unrealized_pnl:+.2f} USDC[/{pnl_style if unrealized_pnl >= 0 else 'bold red'}]" if open_count > 0 else "Nessuna posizione aperta"
+        )
+        
+        self.console.print(Panel(summary_grid, title="📊 [bold yellow]Riepilogo Prestazionale Settimana[/bold yellow]", border_style="yellow"))
+        self.console.print()
+        
+        if not trades:
+            self.console.print("[dim italic]Nessuna operazione registrata negli ultimi 7 giorni.[/dim italic]\n")
+        else:
+            t = Table(expand=True, show_header=True, header_style="bold cyan", padding=(0, 1))
+            t.add_column("#", style="dim", width=4, justify="center")
+            t.add_column("Data/Ora Ingr.", style="bold white", width=14, justify="center")
+            t.add_column("Setup Operativo", width=16, justify="left")
+            t.add_column("Side", width=6, justify="center")
+            t.add_column("Quantità / Controvalore", width=22, justify="right")
+            t.add_column("Prezzo Ingresso", width=16, justify="right")
+            t.add_column("Prezzo Uscita / Live", width=20, justify="right")
+            t.add_column("Target (SL / TP)", width=24, justify="center")
+            t.add_column("Durata", width=10, justify="center")
+            t.add_column("Esito / Motivo Uscita", width=22, justify="left")
+            t.add_column("PnL Netto (USDC)", width=24, justify="right")
+            t.add_column("Stato", width=10, justify="center")
+            
+            for tr in trades:
+                tr_id = f"#{tr['id']}"
+                setup_name = tr["setup"].replace("_BOUNCE", "").replace("_REACTIVE", "").replace("_BREAKOUT", "")
+                if "MEAN_REV" in setup_name or "MEAN" in setup_name:
+                    setup_label = "[bold magenta]MEAN-REV[/bold magenta]"
+                elif "PULLBACK" in setup_name:
+                    setup_label = "[bold cyan]PULLBACK[/bold cyan]"
+                elif "MOMENTUM" in setup_name or "BREAKOUT" in setup_name:
+                    setup_label = "[bold yellow]BREAKOUT[/bold yellow]"
+                else:
+                    setup_label = f"[bold white]{setup_name}[/bold white]"
+                    
+                side_label = f"[bold green]{tr['side']}[/bold green]" if tr["side"] == "LONG" else f"[bold red]{tr['side']}[/bold red]"
+                size_label = f"{tr['qty']:.5f} BTC [dim](${tr['notional']:.1f})[/dim]"
+                entry_p = f"${tr['entry_fill']:,.2f}"
+                exit_p = tr["exit_display"]
+                sl_tp = f"SL: ${tr['stop_price']:,.0f} | TP: ${tr['target_price']:,.0f}"
+                dur = tr["duration_display"]
+                reason = tr["exit_reason_label"]
+                
+                pnl_val = tr["pnl"]
+                pnl_pct_val = tr["pnl_pct"]
+                p_style = "bold green" if pnl_val >= 0 else "bold red"
+                p_sign = "+" if pnl_val >= 0 else ""
+                pnl_str = f"[{p_style}]{p_sign}{pnl_val:.2f} USDC ({p_sign}{pnl_pct_val:.2f}%)[/{p_style}]"
+                
+                status_label = "[bold green]APERTA[/bold green]" if tr["status"] == "OPEN" else "[dim]CHIUSA[/dim]"
+                
+                t.add_row(
+                    tr_id,
+                    tr["entry_display"],
+                    setup_label,
+                    side_label,
+                    size_label,
+                    entry_p,
+                    exit_p,
+                    sl_tp,
+                    dur,
+                    reason,
+                    pnl_str,
+                    status_label,
+                )
+            self.console.print(t)
+            
+        self.console.print("\n[bold white]Premi INVIO per tornare alla Dashboard in tempo reale...[/bold white] ", end="")
+        try:
+            input()
+        except Exception:
+            pass
+        finally:
+            self.console.clear()
+            live.start()
+
     def run(self) -> None:
         """Ciclo principale dell'applicazione con gestione TTY non bloccante."""
         # Avvia worker thread per il trading in background
@@ -1602,6 +1970,14 @@ class TradingAppTUI:
                                 if old_term_settings:
                                     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term_settings)
                                 self.edit_api_credentials_dialog(live)
+                                if is_tty:
+                                    tty.setcbreak(sys.stdin.fileno())
+
+                            # 6. Storico completo operazioni della settimana
+                            elif char.lower() in ("o", "t"):
+                                if old_term_settings:
+                                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term_settings)
+                                self.show_trades_history_dialog(live)
                                 if is_tty:
                                     tty.setcbreak(sys.stdin.fileno())
                     else:
